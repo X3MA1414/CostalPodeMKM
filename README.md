@@ -1,4 +1,4 @@
-⚠️ Este software es de uso privado. No está permitido su uso, modificación o distribución sin autorización del autor. ⚠️
+⚠️ Este software es de uso privado. No está permitido su uso, modificación o distribución sin autorización del autor.
 
 # 📦 Extractor de Códigos Postales (Europa)
 
@@ -43,13 +43,16 @@ Aplicación ligera con interfaz gráfica basada en Tkinter, diseñada para uso r
 
 ---
 
-📁 Estructura de salida
+## 📁 Estructura de salida
+
+<pre>
 Escritorio/
 └── Pedidos_CP/
     └── 24_03_2026/
         ├── cps.txt
         ├── cps(1).txt
         └── cps(2).txt
+</pre>
         
 ⚙️ Tecnologías utilizadas
 Python
