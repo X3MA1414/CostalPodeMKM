@@ -1,3 +1,5 @@
+⚠️ Este software es de uso privado. No está permitido su uso, modificación o distribución sin autorización del autor. ⚠️
+
 # 📦 Extractor de Códigos Postales (Europa)
 
 Aplicación de escritorio desarrollada en Python que permite extraer automáticamente códigos postales de documentos PDF, manteniendo el orden original y soportando múltiples formatos europeos.
