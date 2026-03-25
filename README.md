@@ -46,7 +46,7 @@ Aplicación ligera con interfaz gráfica basada en Tkinter, diseñada para uso r
 ## 📁 Estructura de salida
 
 <pre>
-Escritorio/
+Documentos/
 └── Pedidos_CP/
     └── 24_03_2026/
         ├── cps.txt
