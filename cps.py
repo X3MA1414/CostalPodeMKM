@@ -9,6 +9,14 @@ from datetime import datetime
 from time import perf_counter
 from queue import Empty, Queue
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import socket
+import subprocess
+import time
+import shutil
+from pathlib import Path
+from selenium.common.exceptions import WebDriverException
+import traceback
+from selenium.common.exceptions import ElementClickInterceptedException, TimeoutException
 
 try:
     import pymupdf as fitz
@@ -253,12 +261,88 @@ def escanear_rango_pypdf(args):
 
 
 # === SUBIR A CORREOS ===
-def obtener_chromedriver_path():
-    global chromedriver_path_cache
-    if chromedriver_path_cache is None:
-        chromedriver_path_cache = ChromeDriverManager().install()
-    return chromedriver_path_cache
+from pathlib import Path
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
+CHROME_USER_DATA_DIR = Path.home() / "AppData" / "Local" / "CPSCorreosChrome"
+CHROME_PROFILE_NAME = "Default"
+
+driver_correos = None
+
+def esperar_pagina_cargada(driver, timeout=20):
+    WebDriverWait(driver, timeout).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
+
+
+def click_robusto(driver, locator, timeout=20):
+    wait = WebDriverWait(driver, timeout)
+
+    elem = wait.until(EC.presence_of_element_located(locator))
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block: 'center', inline: 'center'});", elem
+    )
+
+    time.sleep(0.3)
+
+    try:
+        wait.until(EC.element_to_be_clickable(locator)).click()
+        return
+    except ElementClickInterceptedException:
+        pass
+
+    elem = wait.until(EC.presence_of_element_located(locator))
+    driver.execute_script("arguments[0].click();", elem)
+    
+def crear_driver_con_perfil_persistente():
+    CHROME_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    options = webdriver.ChromeOptions()
+    options.add_argument(f"--user-data-dir={CHROME_USER_DATA_DIR}")
+    options.add_argument(f"--profile-directory={CHROME_PROFILE_NAME}")
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+    options.add_argument("--start-maximized")
+
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+
+    driver = webdriver.Chrome(options=options)
+
+    try:
+        driver.execute_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+    except Exception:
+        pass
+
+    return driver
+
+
+def obtener_driver_correos():
+    global driver_correos
+
+    try:
+        if driver_correos is not None:
+            handles = driver_correos.window_handles
+            if handles:
+                _ = driver_correos.current_url
+                return driver_correos
+    except Exception:
+        pass
+
+    try:
+        if driver_correos is not None:
+            driver_correos.quit()
+    except Exception:
+        pass
+
+    driver_correos = crear_driver_con_perfil_persistente()
+    return driver_correos
 
 def subir_a_correos():
     if not ruta_archivo_seleccionado:
@@ -266,38 +350,38 @@ def subir_a_correos():
         return
 
     try:
-        options = webdriver.ChromeOptions()
-        perfil_temp = tempfile.mkdtemp()
-        options.add_argument(f"user-data-dir={perfil_temp}")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option("useAutomationExtension", False)
+        etiqueta.config(text="🟡 Abriendo Chrome con sesión guardada...")
+        app.update_idletasks()
 
-        driver = webdriver.Chrome(
-            service=Service(obtener_chromedriver_path()),
-            options=options,
+        driver = obtener_driver_correos()
+
+        driver.get(
+            "https://epostal.correos.es/OV2PREENVWEB/jsp/mioficinavirtual/_rlvid.jsp.faces?_rap=mov_generadorEtiquetasORHandler.mostrarVista&_rvip=/jsp/mioficinavirtual/miCuenta.jsp"
         )
 
-        driver.execute_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
+        esperar_pagina_cargada(driver)
 
-        driver.get("https://epostal.correos.es/OV2PREENVWEB/jsp/etiquetasOR/genEtiquetasOR.faces")
+        click_robusto(driver, (By.ID, "myform:tipocarga:1"), timeout=20)
 
-        WebDriverWait(driver, 15).until(
-            EC.element_to_be_clickable((By.ID, "myform:tipocarga:1"))
-        ).click()
-
-        WebDriverWait(driver, 15).until(
+        input_file = WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.ID, "myform:fileUpload"))
-        ).send_keys(ruta_archivo_seleccionado)
+        )
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+            input_file
+        )
+        input_file.send_keys(ruta_archivo_seleccionado)
 
-        etiqueta.config(text=f"🚀 Archivo cargado:\n{os.path.basename(ruta_archivo_seleccionado)}")
+        etiqueta.config(
+            text=(
+                f"🚀 Archivo cargado:\n{os.path.basename(ruta_archivo_seleccionado)}\n"
+                f"Perfil Chrome: {CHROME_USER_DATA_DIR.name}"
+            )
+        )
 
     except Exception as e:
-        etiqueta.config(text=f"❌ Error: {e}")
-
-
+        print(traceback.format_exc())
+        etiqueta.config(text=f"❌ Error al abrir/subir en Correos: {e}")
 # === PREVIEW ===
 def actualizar_progreso_preview(porcentaje, actual, total, restante):
     barra["mode"] = "determinate"
