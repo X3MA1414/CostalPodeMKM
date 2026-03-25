@@ -9,11 +9,6 @@ Aplicación de escritorio desarrollada en Python que permite extraer automática
 ## 🚀 Características
 
 - 📄 Extracción automática de códigos postales desde PDF
-- 🌍 Soporte para formatos europeos:
-  - España, Francia, Alemania, Italia (5 dígitos)
-  - Portugal (`1234-567`)
-  - Países Bajos (`1234 AB`)
-  - Reino Unido (`SW1A 1AA`)
 - ⚡ Procesamiento paralelo (multiprocessing)
 - 🧊 Interfaz fluida (sin bloqueos)
 - 📊 Barra de progreso + estimación de tiempo (ETA)
@@ -21,7 +16,7 @@ Aplicación de escritorio desarrollada en Python que permite extraer automática
 - 🌙 Interfaz moderna en modo oscuro
 - 📁 Guardado automático en:
 
-Escritorio/Pedidos_CP/Día_Mes_Año/
+Documentos/Pedidos_CP/Día_Mes_Año/
 
 - 🧾 Generación de archivos sin sobrescribir
 - 📂 Acceso rápido a la carpeta generada
