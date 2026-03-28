@@ -24,7 +24,17 @@ from pathlib import Path
 from selenium.common.exceptions import WebDriverException
 import traceback
 from selenium.common.exceptions import ElementClickInterceptedException, TimeoutException, StaleElementReferenceException, InvalidSessionIdException
+try:
+    import keyring
+except Exception:
+    keyring = None
 
+from tkinter import simpledialog
+try:
+    import winreg
+except Exception:
+    winreg = None
+    
 try:
     import pymupdf as fitz
 except Exception:
@@ -96,6 +106,35 @@ MIN_PARALLEL_PAGES = 40
 TARGET_CHUNKS_PER_WORKER = 4
 MIN_CHUNK_SIZE = 8
 MAX_SCAN_WORKERS = max(1, min(os.cpu_count() or 1, 6))
+RE_CP = re.compile(r"\b\d{5}\b")
+RE_DIGITO = re.compile(r"\d")
+RE_DNI_NIE = re.compile(r"^(?:DNI|NIE|CIF)\b", re.IGNORECASE)
+
+PALABRAS_DIRECCION = (
+    "CALLE", "C/", "AV.", "AVDA", "AVENIDA", "PLAZA", "PASEO", "CAMINO",
+    "RONDA", "TRAVESIA", "TRAVESÍA", "CARRETERA", "BARRIO", "URB",
+    "URBANIZACION", "URBANIZACIÓN", "EDIF", "EDIFICIO", "PORTAL",
+    "PISO", "PUERTA", "AP.", "APARTADO"
+)
+CORREOS_LOGIN_URL = "https://mioficina.correos.es/es/es/login"
+CORREOS_HOME_URL = "https://mioficina.correos.es/es/es/home"
+CORREOS_KEYRING_SERVICE = "cps_correos"
+CORREOS_KEYRING_USER_KEY = "__username__"
+
+def es_linea_documento(linea):
+    linea = linea.strip()
+    return bool(RE_DNI_NIE.match(linea))
+
+
+def parece_linea_direccion(linea):
+    linea = linea.strip()
+    upper = linea.upper()
+
+    if not linea or es_linea_documento(linea):
+        return False
+
+    return bool(RE_DIGITO.search(linea)) or any(p in upper for p in PALABRAS_DIRECCION)
+
 
 # === PARÁMETROS DE POSTLIBRI ===
 POSTLIBRI_DPI = 300
@@ -119,7 +158,581 @@ FG_COLOR = "#ffffff"
 TEXT_SECONDARY = "#cccccc"
 BUTTON_COLOR = "#2d2d2d"
 INFO_BG = "#252526"
+# --- CREDENCIALES ---
+def pedir_credenciales_correos_grande(parent=None, usuario_inicial=""):
+    """Muestra una ventana más grande para introducir correo y contraseña de Correos."""
+    resultado = {"usuario": None, "password": None}
 
+    win = tk.Toplevel(parent or ventana_principal)
+    win.title("Credenciales de Correos")
+    win.geometry("460x220")
+    win.configure(bg=INFO_BG)
+    win.resizable(False, False)
+    win.transient(parent or ventana_principal)
+    win.grab_set()
+
+    # Centrar ventana
+    win.update_idletasks()
+    ancho = 460
+    alto = 220
+    x = (win.winfo_screenwidth() // 2) - (ancho // 2)
+    y = (win.winfo_screenheight() // 2) - (alto // 2)
+    win.geometry(f"{ancho}x{alto}+{x}+{y}")
+
+    frame = tk.Frame(win, bg=INFO_BG)
+    frame.pack(fill="both", expand=True, padx=18, pady=16)
+
+    tk.Label(
+        frame,
+        text="Introduce tus credenciales de Correos",
+        bg=INFO_BG,
+        fg=FG_COLOR,
+        font=("Segoe UI", 12, "bold"),
+    ).pack(anchor="w", pady=(0, 14))
+
+    tk.Label(
+        frame,
+        text="Correo de Correos",
+        bg=INFO_BG,
+        fg=FG_COLOR,
+        font=("Segoe UI", 10),
+    ).pack(anchor="w")
+
+    entry_usuario = tk.Entry(
+        frame,
+        font=("Segoe UI", 12),
+        width=36,
+        bg="#ffffff",
+        fg="#000000",
+        relief="flat",
+    )
+    entry_usuario.pack(fill="x", pady=(4, 12), ipady=6)
+    entry_usuario.insert(0, usuario_inicial or "")
+
+    tk.Label(
+        frame,
+        text="Contraseña",
+        bg=INFO_BG,
+        fg=FG_COLOR,
+        font=("Segoe UI", 10),
+    ).pack(anchor="w")
+
+    entry_password = tk.Entry(
+        frame,
+        font=("Segoe UI", 12),
+        width=36,
+        show="*",
+        bg="#ffffff",
+        fg="#000000",
+        relief="flat",
+    )
+    entry_password.pack(fill="x", pady=(4, 16), ipady=6)
+
+    botones = tk.Frame(frame, bg=INFO_BG)
+    botones.pack(fill="x")
+
+    def aceptar(event=None):
+        usuario = entry_usuario.get().strip()
+        password = entry_password.get()
+        if not usuario or not password:
+            messagebox.showwarning(
+                "Correos",
+                "Debes introducir correo y contraseña.",
+                parent=win,
+            )
+            return
+        resultado["usuario"] = usuario
+        resultado["password"] = password
+        win.destroy()
+
+    def cancelar(event=None):
+        win.destroy()
+
+    tk.Button(
+        botones,
+        text="Cancelar",
+        command=cancelar,
+        bg="#4a4f59",
+        fg=FG_COLOR,
+        relief="flat",
+        font=("Segoe UI", 10, "bold"),
+        padx=14,
+        pady=8,
+        cursor="hand2",
+    ).pack(side="left")
+
+    tk.Button(
+        botones,
+        text="Guardar",
+        command=aceptar,
+        bg="#2f8f4e",
+        fg=FG_COLOR,
+        relief="flat",
+        font=("Segoe UI", 10, "bold"),
+        padx=14,
+        pady=8,
+        cursor="hand2",
+    ).pack(side="right")
+
+    win.bind("<Return>", aceptar)
+    win.bind("<Escape>", cancelar)
+
+    entry_usuario.focus_set()
+    win.wait_window()
+
+    return resultado["usuario"], resultado["password"]
+
+def guardar_credenciales_correos(usuario, password):
+    if keyring is None:
+        raise RuntimeError("Falta instalar keyring: pip install keyring")
+
+    usuario = (usuario or "").strip()
+    if not usuario or not password:
+        raise RuntimeError("Usuario o contraseña vacíos.")
+
+    keyring.set_password(CORREOS_KEYRING_SERVICE, CORREOS_KEYRING_USER_KEY, usuario)
+    keyring.set_password(CORREOS_KEYRING_SERVICE, usuario, password)
+
+
+def cargar_credenciales_correos():
+    if keyring is None:
+        return None, None
+
+    usuario = keyring.get_password(CORREOS_KEYRING_SERVICE, CORREOS_KEYRING_USER_KEY)
+    if not usuario:
+        return None, None
+
+    password = keyring.get_password(CORREOS_KEYRING_SERVICE, usuario)
+    return usuario, password
+
+
+def borrar_credenciales_correos():
+    if keyring is None:
+        return
+
+    usuario = keyring.get_password(CORREOS_KEYRING_SERVICE, CORREOS_KEYRING_USER_KEY)
+    if usuario:
+        try:
+            keyring.delete_password(CORREOS_KEYRING_SERVICE, usuario)
+        except Exception:
+            pass
+        try:
+            keyring.delete_password(CORREOS_KEYRING_SERVICE, CORREOS_KEYRING_USER_KEY)
+        except Exception:
+            pass
+
+def asegurar_credenciales_correos():
+    usuario, password = cargar_credenciales_correos()
+    if usuario and password:
+        return usuario, password
+
+    usuario, password = pedir_credenciales_correos_grande(
+        parent=ventana_principal
+    )
+
+    if not usuario:
+        raise RuntimeError("No se indicó el correo de Correos.")
+    if not password:
+        raise RuntimeError("No se indicó la contraseña de Correos.")
+
+    guardar_credenciales_correos(usuario, password)
+    return usuario, password
+
+def _abrir_generador_si_hay_sesion(driver, timeout=18):
+    """Desde una sesión ya iniciada, abre el generador y espera a que quede usable."""
+    fin = time.time() + timeout
+    ultimo_error = None
+
+    while time.time() < fin:
+        try:
+            enfocar_pestana_correos(driver)
+            driver.get(CORREOS_URL)
+            esperar_carga_completa_pagina(driver, timeout=min(12, timeout))
+
+            if _pagina_parece_login_correos(driver):
+                return False
+
+            if driver.find_elements(By.ID, "myform:tipocarga:1"):
+                return True
+            if driver.find_elements(By.ID, "myform:fileUpload"):
+                return True
+
+            url = (driver.current_url or "").lower()
+            if "epostal.correos.es" in url and "/login" not in url:
+                time.sleep(1)
+                if driver.find_elements(By.ID, "myform:tipocarga:1"):
+                    return True
+                if driver.find_elements(By.ID, "myform:fileUpload"):
+                    return True
+
+        except Exception as e:
+            ultimo_error = e
+
+        time.sleep(0.35)
+
+    raise RuntimeError(
+        f"Hay sesión iniciada, pero no se pudo abrir el generador de Correos. Último error: {ultimo_error}"
+    )
+
+
+def login_automatico_correos(driver, timeout=18):
+    """Hace login automático en Correos usando credenciales guardadas en keyring."""
+    usuario, password = cargar_credenciales_correos()
+    if not usuario or not password:
+        raise RuntimeError(
+            "No hay credenciales guardadas de Correos. Usa 'Configurar credenciales' antes de continuar."
+        )
+
+    ui_set_estado("🔐 Iniciando sesión automática en Correos...")
+
+    driver.get(CORREOS_LOGIN_URL)
+    esperar_carga_completa_pagina(driver, timeout=12)
+    wait = WebDriverWait(driver, timeout)
+
+    # Si ya hay sesión y la web redirige a /home, abrimos el generador directamente
+    if "/home" in (driver.current_url or "").lower():
+        _abrir_generador_si_hay_sesion(driver, timeout=timeout)
+        return
+
+    email = wait.until(EC.element_to_be_clickable((By.ID, "_ul_email")))
+    pwd = wait.until(EC.element_to_be_clickable((By.ID, "_ul_password_email")))
+
+    driver.execute_script("""
+        const el = arguments[0];
+        el.focus();
+        el.value = '';
+        el.dispatchEvent(new Event('input', {bubbles:true}));
+        el.dispatchEvent(new Event('change', {bubbles:true}));
+    """, email)
+    email.clear()
+    email.send_keys(usuario)
+    driver.execute_script("""
+        const el = arguments[0];
+        el.dispatchEvent(new Event('input', {bubbles:true}));
+        el.dispatchEvent(new Event('change', {bubbles:true}));
+        el.dispatchEvent(new Event('blur', {bubbles:true}));
+    """, email)
+
+    driver.execute_script("""
+        const el = arguments[0];
+        el.focus();
+        el.value = '';
+        el.dispatchEvent(new Event('input', {bubbles:true}));
+        el.dispatchEvent(new Event('change', {bubbles:true}));
+    """, pwd)
+    pwd.clear()
+    pwd.send_keys(password)
+    driver.execute_script("""
+        const el = arguments[0];
+        el.dispatchEvent(new Event('input', {bubbles:true}));
+        el.dispatchEvent(new Event('change', {bubbles:true}));
+        el.dispatchEvent(new Event('blur', {bubbles:true}));
+    """, pwd)
+
+    try:
+        chk = driver.find_element(By.ID, "_ul_remember_checbox")
+        if not chk.is_selected():
+            driver.execute_script("arguments[0].click();", chk)
+            driver.execute_script(
+                "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
+                chk
+            )
+    except Exception:
+        pass
+
+    boton = wait.until(
+        EC.presence_of_element_located(
+            (By.CSS_SELECTOR, "correos-ui-button button[type='submit']")
+        )
+    )
+
+    WebDriverWait(driver, 10).until(
+        lambda d: boton.is_enabled() and not boton.get_attribute("disabled")
+    )
+
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", boton)
+    time.sleep(0.15)
+    handles_antes = list(driver.window_handles)
+
+    try:
+        boton.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", boton)
+
+    def _esperar_fin_login(d):
+        try:
+            handles = d.window_handles
+            if len(handles) > len(handles_antes):
+                d.switch_to.window(handles[-1])
+
+            enfocar_pestana_correos(d)
+            url = (d.current_url or "").lower()
+
+            if "/home" in url:
+                return True
+            if "epostal.correos.es" in url and "/login" not in url:
+                return True
+            if not _pagina_parece_login_correos(d):
+                return True
+            return False
+        except Exception:
+            return False
+
+    WebDriverWait(driver, timeout).until(_esperar_fin_login)
+
+    enfocar_pestana_correos(driver)
+    try:
+        esperar_carga_completa_pagina(driver, timeout=30)
+    except Exception:
+        pass
+
+    time.sleep(0.6)
+
+    # Tras el login, no basta con /home: abrimos el generador sí o sí
+    if _abrir_generador_si_hay_sesion(driver, timeout=timeout):
+        return
+
+    texto = (driver.page_source or "").lower()
+    if (
+        "contraseña incorrect" in texto
+        or "contrasena incorrect" in texto
+        or "correo incorrect" in texto
+        or "usuario o contraseña incorrect" in texto
+        or "usuario o contrasena incorrect" in texto
+        or "email o contraseña incorrect" in texto
+        or "email o contrasena incorrect" in texto
+    ):
+        raise RuntimeError("Correos rechazó las credenciales. Revisa usuario y contraseña.")
+
+    raise RuntimeError(
+        f"No se pudo confirmar la sesión de Correos tras el login. URL final: {(driver.current_url or '').lower()}"
+    )
+
+
+def asegurar_sesion_correos(driver, timeout=30):
+    """Garantiza que haya una sesión válida en Correos antes de continuar."""
+    ui_set_estado("🔐 Verificando sesión de Correos...")
+
+    driver.get(CORREOS_LOGIN_URL)
+    esperar_carga_completa_pagina(driver, timeout=timeout)
+    enfocar_pestana_correos(driver)
+
+    url_actual = (driver.current_url or "").lower()
+
+    # Si ya estamos en /home, no nos quedamos ahí: abrimos el generador
+    if "/home" in url_actual:
+        _abrir_generador_si_hay_sesion(driver, timeout=timeout)
+        return
+
+    # Si seguimos en login, hacemos login automático
+    if _pagina_parece_login_correos(driver):
+        login_automatico_correos(driver, timeout=timeout)
+        return
+
+    # Si estamos en otra página autenticada, intentamos abrir el generador
+    if _abrir_generador_si_hay_sesion(driver, timeout=timeout):
+        return
+
+    raise RuntimeError("No se pudo confirmar una sesión válida de Correos.")
+
+def _pagina_parece_login_correos(driver):
+    """Detecta el login real de Correos evitando falsos positivos."""
+    try:
+        url = (driver.current_url or "").lower()
+
+        # Si la URL ya apunta al login, es login.
+        if "/login" in url:
+            return True
+
+        # Comprobamos los campos reales del formulario de acceso.
+        emails = driver.find_elements(By.ID, "_ul_email")
+        pwds = driver.find_elements(By.ID, "_ul_password_email")
+
+        if emails and pwds:
+            try:
+                return emails[0].is_displayed() and pwds[0].is_displayed()
+            except Exception:
+                return True
+
+        return False
+    except Exception:
+        return False
+
+def cerrar_sesion_correos(driver, timeout=15):
+    """Intenta cerrar sesión en Correos antes de cerrar Chrome para dejar el perfil limpio."""
+    try:
+        ui_set_estado("🔓 Cerrando sesión de Correos...")
+
+        # Intentamos primero en la página actual
+        enfocar_pestana_correos(driver)
+        try:
+            esperar_carga_completa_pagina(driver, timeout=10)
+        except Exception:
+            pass
+
+        elems = driver.find_elements(By.ID, "cerrarsesion")
+
+        # Si no está el enlace en la página actual, vamos a home
+        if not elems:
+            driver.get(CORREOS_HOME_URL)
+            esperar_carga_completa_pagina(driver, timeout=timeout)
+            enfocar_pestana_correos(driver)
+            elems = driver.find_elements(By.ID, "cerrarsesion")
+
+        if not elems:
+            raise RuntimeError("No se encontró el enlace de cerrar sesión en Correos.")
+
+        enlace = elems[0]
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", enlace)
+        time.sleep(0.5)
+
+        try:
+            enlace.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", enlace)
+
+        def _esperar_logout(d):
+            try:
+                url = (d.current_url or "").lower()
+                if "/login" in url:
+                    return True
+                if _pagina_parece_login_correos(d):
+                    return True
+                return False
+            except Exception:
+                return False
+
+        WebDriverWait(driver, timeout).until(_esperar_logout)
+        ui_set_estado("🔓 Sesión de Correos cerrada correctamente.")
+        return True
+
+    except Exception as e:
+        # No bloqueamos el flujo principal si el logout falla,
+        # pero dejamos constancia en estado para depuración.
+        ui_set_estado(f"⚠️ No se pudo cerrar sesión en Correos: {e}")
+        return False
+def _sesion_correos_valida(driver, timeout=30, navegar=True):
+    """Comprueba la sesión de Correos. Puede validar en la página actual o navegando al generador."""
+    if navegar:
+        driver.get(CORREOS_URL)
+        esperar_carga_completa_pagina(driver, timeout=timeout)
+
+    if _pagina_parece_login_correos(driver):
+        return False
+
+    # Señales de zona autenticada válida
+    if driver.find_elements(By.ID, "myform:tipocarga:1"):
+        return True
+    if driver.find_elements(By.ID, "myform:fileUpload"):
+        return True
+
+    url = (driver.current_url or "").lower()
+    if "/home" in url:
+        return True
+
+    return "epostal.correos.es" in url and "/login" not in url
+
+
+def asegurar_sesion_correos(driver, timeout=30):
+    """Garantiza que haya una sesión válida en Correos antes de continuar."""
+    ui_set_estado("🔐 Verificando sesión de Correos...")
+
+    # SIEMPRE abrimos primero la URL de login:
+    # - si no hay sesión, se verá el formulario
+    # - si ya hay sesión, Correos redirige a /home y eso es éxito
+    driver.get(CORREOS_LOGIN_URL)
+    esperar_carga_completa_pagina(driver, timeout=timeout)
+    enfocar_pestana_correos(driver)
+
+    url_actual = (driver.current_url or "").lower()
+
+    # Caso clave: si la propia web redirige a /home, ya hay sesión iniciada
+    if "/home" in url_actual:
+        time.sleep(1.5)
+        return
+
+    # Si seguimos en login, hacemos login automático
+    if _pagina_parece_login_correos(driver):
+        login_automatico_correos(driver, timeout=timeout)
+
+    # Tras el login, volvemos a comprobar
+    enfocar_pestana_correos(driver)
+    try:
+        esperar_carga_completa_pagina(driver, timeout=timeout)
+    except Exception:
+        pass
+
+    url_post_login = (driver.current_url or "").lower()
+
+    # Segundo caso clave: si tras el login estamos en /home, también es éxito
+    if "/home" in url_post_login:
+        time.sleep(1.5)
+        return
+
+    # Última validación: probamos la zona autenticada real
+    deadline = time.time() + timeout
+    ultimo_error = None
+
+    while time.time() < deadline:
+        try:
+            enfocar_pestana_correos(driver)
+
+            url = (driver.current_url or "").lower()
+            if "/home" in url:
+                return
+
+            if _sesion_correos_valida(driver, timeout=10, navegar=False):
+                return
+
+            if _sesion_correos_valida(driver, timeout=10, navegar=True):
+                return
+        except Exception as e:
+            ultimo_error = e
+
+        time.sleep(1.0)
+
+    raise RuntimeError(
+        f"No se pudo confirmar una sesión válida en Correos tras el login. Último error: {ultimo_error}"
+    )
+def configurar_credenciales_correos():
+    try:
+        usuario_actual, _ = cargar_credenciales_correos()
+
+        usuario, password = pedir_credenciales_correos_grande(
+            parent=ventana_principal,
+            usuario_inicial=usuario_actual or "",
+        )
+
+        if not usuario or not password:
+            return
+
+        guardar_credenciales_correos(usuario, password)
+        ui_set_estado("✅ Credenciales de Correos guardadas de forma segura.")
+    except Exception as e:
+        ui_show_error("Correos", f"No se pudieron guardar las credenciales:\n{e}")
+
+def eliminar_credenciales_correos_ui():
+    try:
+        borrar_credenciales_correos()
+        ui_set_estado("🗑️ Credenciales de Correos eliminadas.")
+    except Exception as e:
+        ui_show_error("Correos", f"No se pudieron borrar las credenciales:\n{e}")
+
+def credenciales_correos_configuradas():
+    usuario, password = cargar_credenciales_correos()
+    return bool(usuario and password)
+
+def asegurar_credenciales_correos_desde_ui():
+    if credenciales_correos_configuradas():
+        return True
+
+    try:
+        configurar_credenciales_correos()
+        return credenciales_correos_configuradas()
+    except Exception:
+        return False
+
+    
 
 # === UTILIDADES GENERALES ===
 def resolver_ruta_recurso(relative_path):
@@ -212,64 +825,90 @@ def extraer_texto_pagina_con_pypdf(page):
 
 # === ANÁLISIS DE TEXTO ===
 def analizar_pagina_destino_espana(texto):
-    """Analiza el texto de una página para identificar nombre, dirección, ciudad, código postal visible y códigos finales a exportar."""
+    """Analiza una página SPAIN contemplando DNI en línea aparte y direcciones en varias líneas."""
     search_cp = RE_CP.search
-    search_digit = RE_DIGITO.search
     token = TOKEN_SPAIN
     sufijo = SUFIJO_CP
 
-    nombre_partes = []
     codigos = []
-    append_nombre = nombre_partes.append
-    append_codigo = codigos.append
 
-    direccion = ""
-    cp = ""
-    ciudad = ""
-    lineas_limpias = 0
-    esperando_ciudad = False
-
-    prev1 = ""
-    prev2 = ""
-    prev3 = ""
-
-    # Recorremos cada línea para reconstruir la estructura típica del destinatario.
-    for raw_line in texto.splitlines():
-        stripped = raw_line.strip()
-        if stripped:
-            lineas_limpias += 1
-            if not direccion:
-                if search_digit(stripped):
-                    direccion = stripped
-                    esperando_ciudad = True
-                else:
-                    append_nombre(stripped)
-            elif esperando_ciudad:
-                match = search_cp(stripped)
-                if match:
-                    cp = match.group(0)
-                    ciudad = stripped.replace(cp, "", 1).strip()
-                esperando_ciudad = False
-
-        # Cuando aparece la palabra SPAIN, buscamos el CP asociado en las líneas anteriores.
-        if token in raw_line.upper():
-            match = search_cp(prev1) or search_cp(prev2) or search_cp(prev3)
-            if match:
-                append_codigo(match.group(0) + sufijo)
-
-        prev3, prev2, prev1 = prev2, prev1, raw_line
-
-    if lineas_limpias < 3 or not direccion:
+    lineas = [linea.strip() for linea in texto.splitlines() if linea.strip()]
+    if not lineas:
         return EMPTY_PREVIEW, EMPTY_CODES
 
-    return (cp, " ".join(nombre_partes), direccion, ciudad), tuple(codigos)
+    # Buscar la línea del país
+    idx_spain = None
+    for i, linea in enumerate(lineas):
+        if token in linea.upper():
+            idx_spain = i
+            break
 
+    if idx_spain is None:
+        return EMPTY_PREVIEW, EMPTY_CODES
+
+    # Obtener CP final para exportación buscando hasta 3 líneas antes de SPAIN
+    for i, linea in enumerate(lineas):
+        if token in linea.upper():
+            for j in range(i - 1, max(-1, i - 4), -1):
+                match = search_cp(lineas[j])
+                if match:
+                    codigos.append(match.group(0) + sufijo)
+                    break
+
+    bloque = lineas[:idx_spain]
+    if not bloque:
+        return EMPTY_PREVIEW, tuple(codigos)
+
+    # La ciudad/CP suele ser la última línea antes de SPAIN que contiene CP
+    idx_ciudad = None
+    cp = ""
+    ciudad = ""
+
+    for i in range(len(bloque) - 1, -1, -1):
+        match = search_cp(bloque[i])
+        if match:
+            idx_ciudad = i
+            cp = match.group(0)
+            ciudad = bloque[i].replace(cp, "", 1).strip(" ,")
+            break
+
+    if idx_ciudad is None:
+        return EMPTY_PREVIEW, tuple(codigos)
+
+    antes_ciudad = bloque[:idx_ciudad]
+    if not antes_ciudad:
+        return (cp, "", "", ciudad), tuple(codigos)
+
+    # El nombre será la primera línea útil
+    nombre = antes_ciudad[0]
+    resto = antes_ciudad[1:]
+
+    extras = []
+    direccion_partes = []
+
+    for linea in resto:
+        if es_linea_documento(linea):
+            continue
+
+        if direccion_partes:
+            direccion_partes.append(linea)
+            continue
+
+        if parece_linea_direccion(linea):
+            direccion_partes.append(linea)
+        else:
+            extras.append(linea)
+
+    direccion = " ".join(extras + direccion_partes).strip()
+
+    return (cp, nombre, direccion, ciudad), tuple(codigos)
 
 def formatear_linea_preview(idx, cp, nombre, direccion, ciudad):
-    """Construye la línea monoespaciada que se muestra en el selector de páginas del preview."""
+    """Construye la línea del preview en el orden: Nº Pedido | Nombre | Código postal."""
     return (
-        f"{str(idx + 1).rjust(3)} | {cp.ljust(6)} | {nombre[:20].ljust(20)} | "
-        f"{direccion[:38].ljust(38)} | {ciudad[:15].ljust(15)}"
+        f"{str(idx + 1):^10} | "
+        f"{nombre[:32].ljust(32)} | "
+        f"{cp:^13}"
     )
 
 
@@ -599,25 +1238,66 @@ def postlibri_generar_lbxs(labels_seleccionadas, template_path, out_dir, usar_di
     return generados
 
 
+def _postlibri_bpac_invocar(obj, nombre_metodo, *args, obligatorio=True):
+    """Invoca de forma segura un método COM de b-PAC y evita reintentos sobre atributos que en algunos entornos llegan como booleanos."""
+    miembro = getattr(obj, nombre_metodo, None)
+    if miembro is None:
+        if obligatorio:
+            raise RuntimeError(f"b-PAC no expone '{nombre_metodo}'")
+        return None
+    if callable(miembro):
+        return miembro(*args)
+    if obligatorio and args:
+        raise RuntimeError(
+            f"b-PAC devolvió un valor no invocable para '{nombre_metodo}': {type(miembro).__name__}"
+        )
+    return miembro
+
+
 def postlibri_imprimir_lbxs(lbx_paths, printer_name=POSTLIBRI_DEFAULT_PRINTER):
     """Envía una secuencia de archivos LBX a la impresora Brother mediante la automatización b-PAC de Windows."""
     if os.name != "nt":
         raise RuntimeError("La impresión b-PAC solo está disponible en Windows")
 
     try:
+        import pythoncom
         import win32com.client
     except Exception as e:
         raise RuntimeError("No se encontró pywin32/win32com. Instala pywin32 para imprimir con Brother.") from e
 
-    for lbx_path in lbx_paths:
-        obj_doc = win32com.client.Dispatch("bpac.Document")
-        if not obj_doc.Open(str(lbx_path)):
-            raise RuntimeError(f"No se pudo abrir la plantilla LBX: {lbx_path}")
-        obj_doc.SetPrinter(printer_name, True)
-        obj_doc.StartPrint("", 0)
-        obj_doc.PrintOut(1, 0)
-        obj_doc.EndPrint()
-        obj_doc.Close()
+    pythoncom.CoInitialize()
+    try:
+        total = len(lbx_paths)
+        for idx, lbx_path in enumerate(lbx_paths, start=1):
+            obj_doc = None
+            try:
+                obj_doc = win32com.client.Dispatch("bpac.Document")
+                opened = _postlibri_bpac_invocar(obj_doc, "Open", str(lbx_path))
+                if not opened:
+                    raise RuntimeError(f"No se pudo abrir la plantilla LBX: {lbx_path}")
+
+                _postlibri_bpac_invocar(obj_doc, "SetPrinter", printer_name, True)
+                _postlibri_bpac_invocar(obj_doc, "StartPrint", "", 0)
+                _postlibri_bpac_invocar(obj_doc, "PrintOut", 1, 0)
+
+                end_print = getattr(obj_doc, "EndPrint", None)
+                if callable(end_print):
+                    end_print()
+
+                close_doc = getattr(obj_doc, "Close", None)
+                if callable(close_doc):
+                    close_doc()
+
+                if idx < total:
+                    time.sleep(0.35)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Error al imprimir la etiqueta {idx}/{total} en Brother QL-700: {e}"
+                ) from e
+            finally:
+                obj_doc = None
+    finally:
+        pythoncom.CoUninitialize()
 
 
 def postlibri_obtener_estado_impresora(printer_name=POSTLIBRI_DEFAULT_PRINTER):
@@ -890,7 +1570,7 @@ CHROME_USER_DATA_DIR = Path.home() / "AppData" / "Local" / "CPSCorreosChrome"
 CHROME_FALLBACK_USER_DATA_DIR = Path.home() / "AppData" / "Local" / "CPSCorreosChromeSelenium"
 CHROME_ACTIVE_USER_DATA_DIR = CHROME_USER_DATA_DIR
 CHROME_DOWNLOAD_DIR = Path.home() / 'Documents' / 'Pedidos_CP' / 'Correos_PDF'
-CORREOS_AUTOMATION_HEADLESS = False
+CORREOS_AUTOMATION_HEADLESS = True
 CORREOS_URL = (
     "https://epostal.correos.es/OV2PREENVWEB/jsp/mioficinavirtual/"
     "_rlvid.jsp.faces?_rap=mov_generadorEtiquetasORHandler.mostrarVista"
@@ -922,7 +1602,7 @@ def hacer_click_robusto(driver, locator, timeout=20, intentos=5):
             driver.execute_script(
                 "arguments[0].scrollIntoView({block: 'center', inline: 'center'});", elem
             )
-            time.sleep(0.35)
+            time.sleep(0.15)
 
             elem = wait.until(EC.element_to_be_clickable(locator))
             try:
@@ -933,7 +1613,7 @@ def hacer_click_robusto(driver, locator, timeout=20, intentos=5):
             return
         except (StaleElementReferenceException, ElementClickInterceptedException, TimeoutException) as e:
             ultimo_error = e
-            time.sleep(0.5)
+            time.sleep(0.2)
             continue
 
     if ultimo_error:
@@ -991,6 +1671,58 @@ def esperar_pdf_descargado(download_dir: Path, existentes=None, timeout=180):
         f"No se descargó ningún PDF en {download_dir} dentro de {timeout} segundos."
     )
 
+def esperar_pdf_descargado_o_login(driver, download_dir: Path, existentes=None, timeout=45):
+    """Espera un PDF nuevo, pero aborta antes si la sesión de Correos ha caducado o vuelve al login."""
+    if existentes is None:
+        existentes = set()
+
+    deadline = time.time() + timeout
+    ultimo_candidato = None
+    ultimo_url = ""
+
+    while time.time() < deadline:
+        # 1) Si Correos vuelve al login, abortamos enseguida
+        try:
+            ultimo_url = (driver.current_url or "").lower()
+            if _pagina_parece_login_correos(driver):
+                raise RuntimeError(
+                    "La sesión de Correos no está iniciada o ha caducado mientras se intentaba generar/descargar el PDF. "
+                    "Pulsa '🔐 Iniciar sesión Correos' y vuelve a intentarlo."
+                )
+            if "login" in ultimo_url or "autentic" in ultimo_url:
+                raise RuntimeError(
+                    "Correos ha redirigido al inicio de sesión antes de descargar el PDF. "
+                    "Pulsa '🔐 Iniciar sesión Correos' y vuelve a intentarlo."
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+        # 2) Comprobamos si ya apareció el PDF
+        actuales = listar_pdfs_descargados(download_dir)
+        nuevos = [p for p in actuales if p not in existentes]
+
+        if nuevos:
+            nuevos.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            candidato = nuevos[0]
+            ultimo_candidato = candidato
+            temporal = candidato.with_suffix(candidato.suffix + ".crdownload")
+            if candidato.exists() and not temporal.exists():
+                return candidato
+
+        # 3) Si no hay .crdownload y había candidato, damos por terminada la descarga
+        parciales = list(download_dir.glob("*.crdownload"))
+        if not parciales and ultimo_candidato and ultimo_candidato.exists():
+            return ultimo_candidato
+
+        time.sleep(1)
+
+    raise TimeoutException(
+        f"Correos no descargó ningún PDF en {timeout} segundos. "
+        "Puede que no haya sesión iniciada, que la sesión haya caducado o que la web se haya quedado bloqueada."
+    )
+
 
 def _configurar_opciones_chrome(headless=False, user_data_dir=None):
     """Construye las opciones de Chrome necesarias para reutilizar perfil, descargas automáticas y modo headless si aplica."""
@@ -1025,7 +1757,7 @@ def _configurar_opciones_chrome(headless=False, user_data_dir=None):
 
 
 def _localizar_ejecutable_chrome():
-    """Busca la instalación local de Google Chrome en las rutas habituales de Windows."""
+    """Busca Google Chrome en rutas habituales, PATH y registro de Windows."""
     candidatos = [
         Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Google/Chrome/Application/chrome.exe",
         Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Google/Chrome/Application/chrome.exe",
@@ -1034,8 +1766,28 @@ def _localizar_ejecutable_chrome():
     for candidato in candidatos:
         if candidato.exists():
             return str(candidato)
-    return "chrome"
 
+    for nombre in ("chrome.exe", "chrome"):
+        ruta = shutil.which(nombre)
+        if ruta:
+            return ruta
+
+    if winreg is not None:
+        claves = [
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+        ]
+        for raiz in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for clave in claves:
+                try:
+                    with winreg.OpenKey(raiz, clave) as k:
+                        valor, _ = winreg.QueryValueEx(k, "")
+                    if valor and os.path.exists(valor):
+                        return valor
+                except OSError:
+                    pass
+
+    return None
 
 def _hay_login_chrome_abierto():
     """Indica si el proceso manual de Chrome para login sigue abierto."""
@@ -1111,11 +1863,14 @@ def _driver_esta_vivo(driver):
 
 
 def _limpiar_perfil_runtime():
-    """Elimina la copia temporal del perfil de Chrome usada durante la automatización."""
+    """Elimina el perfil runtime solo si es realmente temporal."""
     global chrome_runtime_profile_dir
     try:
         if chrome_runtime_profile_dir:
-            shutil.rmtree(chrome_runtime_profile_dir, ignore_errors=True)
+            ruta = Path(chrome_runtime_profile_dir)
+            ruta_persistente = Path(CHROME_FALLBACK_USER_DATA_DIR)
+            if ruta.resolve() != ruta_persistente.resolve():
+                shutil.rmtree(ruta, ignore_errors=True)
     except Exception:
         pass
     chrome_runtime_profile_dir = None
@@ -1155,17 +1910,24 @@ def _sincronizar_runtime_a_perfil_base():
 
 def cerrar_driver_correos(sincronizar_perfil=False):
     """Cierra el driver activo de Correos y, opcionalmente, sincroniza la copia temporal del perfil."""
-    global driver_correos, driver_correos_visible
+    global driver_correos, driver_correos_visible, CHROME_ACTIVE_USER_DATA_DIR
+
     try:
         if driver_correos is not None:
             driver_correos.quit()
     except Exception:
         pass
+
     driver_correos = None
     driver_correos_visible = False
+
     if sincronizar_perfil:
         _sincronizar_runtime_a_perfil_base()
+
     _limpiar_perfil_runtime()
+
+    # IMPORTANTE: tras cerrar, volvemos siempre al perfil persistente
+    CHROME_ACTIVE_USER_DATA_DIR = CHROME_USER_DATA_DIR
 
 
 def _crear_copia_perfil_correos(origen: Path) -> Path:
@@ -1197,7 +1959,7 @@ def _crear_copia_perfil_correos(origen: Path) -> Path:
 
 
 def obtener_driver_correos(headless=True, forzar_nuevo=False):
-    """Devuelve un driver listo para usar, reutilizando el existente cuando es válido o creando uno nuevo cuando hace falta."""
+    """Devuelve un driver listo para usar usando un perfil persistente dedicado para Selenium."""
     global driver_correos, driver_correos_visible, CHROME_ACTIVE_USER_DATA_DIR, chrome_runtime_profile_dir
 
     _limpiar_referencia_login_chrome()
@@ -1213,7 +1975,12 @@ def obtener_driver_correos(headless=True, forzar_nuevo=False):
 
     cerrar_driver_correos()
 
-    chrome_runtime_profile_dir = _crear_copia_perfil_correos(Path(CHROME_ACTIVE_USER_DATA_DIR))
+    # PERFIL PERSISTENTE PARA LA AUTOMATIZACIÓN
+    chrome_runtime_profile_dir = Path(CHROME_FALLBACK_USER_DATA_DIR)
+    chrome_runtime_profile_dir.mkdir(parents=True, exist_ok=True)
+
+    CHROME_ACTIVE_USER_DATA_DIR = chrome_runtime_profile_dir
+
     driver_correos = crear_driver_correos(
         headless=headless,
         user_data_dir=chrome_runtime_profile_dir,
@@ -1223,29 +1990,36 @@ def obtener_driver_correos(headless=True, forzar_nuevo=False):
 
 
 def abrir_login_correos():
-    """Abre una ventana de Chrome real para que el usuario inicie sesión manualmente en Correos con el perfil persistente."""
+    """Abre una ventana de Chrome real con el mismo perfil que usa la automatización de Correos."""
     global CHROME_ACTIVE_USER_DATA_DIR, chrome_login_process
     try:
         cerrar_driver_correos()
         _limpiar_referencia_login_chrome()
 
-        user_data_dir = CHROME_ACTIVE_USER_DATA_DIR
-        Path(user_data_dir).mkdir(parents=True, exist_ok=True)
+        user_data_dir = Path(CHROME_FALLBACK_USER_DATA_DIR)
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+        CHROME_ACTIVE_USER_DATA_DIR = user_data_dir
 
         chrome_exe = _localizar_ejecutable_chrome()
+        if not chrome_exe:
+            raise RuntimeError(
+                "No se ha encontrado Google Chrome en este equipo. "
+                "Instálalo o ajusta manualmente la ruta de chrome.exe en el código."
+            )
+
         cmd = [
             chrome_exe,
             f"--user-data-dir={user_data_dir}",
+            "--profile-directory=Default",
             "--new-window",
-            CORREOS_URL,
+            CORREOS_LOGIN_URL,
         ]
         chrome_login_process = subprocess.Popen(cmd)
 
         etiqueta_estado.config(
             text=(
-                "🔐 Chrome abierto para iniciar sesión en Correos. "
-                "Inicia sesión manualmente y, cuando termines, CIERRA esa ventana de Chrome.\n"
-                "Después arrastra el PDF'."
+                "🔐 Chrome abierto para Correos con el perfil de automatización.\n"
+                "Comprueba la sesión y, cuando termines, cierra esa ventana."
             )
         )
     except Exception as e:
@@ -1256,7 +2030,6 @@ def abrir_login_correos():
             f"Detalle: {e}"
         )
         etiqueta_estado.config(text=f"❌ Error al abrir Chrome de Correos: {e}")
-
 
 def esperar_clickable_robusto(driver, locator, timeout=30):
     """Espera a que un elemento exista, se centre en pantalla y quede realmente clickable."""
@@ -1295,25 +2068,7 @@ def esperar_elemento_estable(driver, locator, timeout=30):
         raise ultimo
     raise TimeoutException(f'No se pudo estabilizar el elemento: {locator}')
 
-
-def _pagina_parece_login_correos(driver):
-    """Detecta si la página actual parece ser el formulario de login de Correos."""
-    try:
-        if driver.find_elements(By.CSS_SELECTOR, "input[type='password']"):
-            return True
-        texto = (driver.page_source or "").lower()
-        return (
-            "iniciar sesión" in texto
-            or "iniciar sesion" in texto
-            or "identifícate" in texto
-            or "accede" in texto and "contraseña" in texto
-            or "contrasena" in texto
-        )
-    except Exception:
-        return False
-
-
-def esperar_generador_correos(driver, timeout=30):
+def esperar_generador_correos(driver, timeout=20):
     """Espera hasta que aparezca el generador de etiquetas de Correos o detecta que falta autenticación."""
     def _condicion(d):
         if d.find_elements(By.ID, "myform:tipocarga:1"):
@@ -1324,7 +2079,15 @@ def esperar_generador_correos(driver, timeout=30):
             return "login"
         return False
 
-    estado = WebDriverWait(driver, timeout).until(_condicion)
+    try:
+        estado = WebDriverWait(driver, timeout).until(_condicion)
+    except TimeoutException as e:
+        raise RuntimeError(
+            f"Correos no mostró el generador de etiquetas en {timeout}s. "
+            "Seguramente no hay sesión iniciada o la web no respondió correctamente. "
+            "Pulsa '🔐 Iniciar sesión Correos' y vuelve a intentarlo."
+        ) from e
+
     if estado == "login":
         raise RuntimeError(
             "No hay sesión iniciada en Correos. Pulsa '🔐 Iniciar sesión Correos', entra manualmente y vuelve a intentarlo."
@@ -1458,7 +2221,29 @@ def postlibri_seleccionar_pdf_descargado():
         return
     threading.Thread(target=postlibri_procesar_pdf_descargado_manual, args=(ruta,), daemon=True).start()
 
+def ui_set_estado(texto):
+    if ventana_principal is not None:
+        ventana_principal.after(0, lambda t=texto: etiqueta_estado.config(text=t))
 
+def ui_show_error(titulo, mensaje):
+    if ventana_principal is not None:
+        ventana_principal.after(0, lambda: messagebox.showerror(titulo, mensaje))
+
+def ui_barra_mostrar(modo="determinate", valor=0):
+    if ventana_principal is not None:
+        def _accion():
+            barra_progreso.pack(pady=10)
+            barra_progreso["mode"] = modo
+            barra_progreso["value"] = valor
+            if modo == "indeterminate":
+                barra_progreso.start(12)
+        ventana_principal.after(0, _accion)
+
+def ui_barra_ocultar():
+    if ventana_principal is not None:
+        ventana_principal.after(0, barra_progreso.stop)
+        ventana_principal.after(0, barra_progreso.pack_forget)
+        
 def subir_archivo_a_correos():
     """Ejecuta de extremo a extremo la subida del TXT a Correos, descarga el PDF generado y lo manda a impresión Brother."""
     if not ruta_archivo_actual:
@@ -1474,14 +2259,11 @@ def subir_archivo_a_correos():
 
     for intento in range(2):
         try:
-            etiqueta_estado.config(
-                text=(
-                    "🟡 Conectando con Correos..."
-                    if not CORREOS_AUTOMATION_HEADLESS
-                    else "🟡 Conectando con Correos en segundo plano..."
-                )
+            ui_set_estado(
+                "🟡 Conectando con Correos..."
+                if not CORREOS_AUTOMATION_HEADLESS
+                else "🟡 Conectando con Correos en segundo plano..."
             )
-            ventana_principal.update_idletasks()
 
             # 1) Abrimos o reutilizamos una sesión válida de Chrome con el perfil persistente.
             driver = obtener_driver_correos(
@@ -1493,19 +2275,27 @@ def subir_archivo_a_correos():
             limpiar_descargas_parciales(download_dir)
             pdfs_antes = listar_pdfs_descargados(download_dir)
 
-            etiqueta_estado.config(text="🟡 Abriendo Correos con la sesión guardada...")
-            ventana_principal.update_idletasks()
+            ui_set_estado("🟡 Abriendo Correos con la sesión guardada...")
             # 2) Navegamos al generador de etiquetas y comprobamos que la sesión siga autenticada.
-            driver.get(CORREOS_URL)
-            esperar_carga_completa_pagina(driver, timeout=30)
-            esperar_generador_correos(driver, timeout=20)
+            driver = obtener_driver_correos(
+                headless=CORREOS_AUTOMATION_HEADLESS,
+                forzar_nuevo=(intento > 0),
+            )
 
-            etiqueta_estado.config(text="🟡 Seleccionando tipo de carga...")
-            ventana_principal.update_idletasks()
+            download_dir = obtener_directorio_descargas_correos()
+            limpiar_descargas_parciales(download_dir)
+            pdfs_antes = listar_pdfs_descargados(download_dir)
+
+            # 2) ANTES de entrar al generador, obligamos a tener sesión válida
+            asegurar_sesion_correos(driver, timeout=18)
+
+            ui_set_estado("🟡 Verificando generador de Correos...")
+            esperar_generador_correos(driver, timeout=12)
+
+            ui_set_estado("🟡 Seleccionando tipo de carga...")
             hacer_click_robusto(driver, (By.ID, "myform:tipocarga:1"), timeout=30)
 
-            etiqueta_estado.config(text="🟡 Cargando TXT...")
-            ventana_principal.update_idletasks()
+            ui_set_estado("🟡 Cargando TXT...")
 
             # 3) Subimos el TXT generado a la plataforma de Correos.
             input_file = WebDriverWait(driver, 30).until(
@@ -1562,10 +2352,17 @@ def subir_archivo_a_correos():
             )
 
             # 4) Esperamos a que Correos genere y descargue el PDF final de etiquetas.
-            pdf_descargado = esperar_pdf_descargado(download_dir, existentes=pdfs_antes, timeout=180)
-
-            etiqueta_estado.config(text="🟡 PDF descargado. Preparando impresión Brother QL-700...")
+            etiqueta_estado.config(text="🟡 Esperando descarga del PDF de Correos...")
+            pdf_descargado = esperar_pdf_descargado_o_login(
+                driver,
+                download_dir,
+                existentes=pdfs_antes,
+                timeout=45,
+            )
+            etiqueta_estado.config(text="🟡 PDF descargado. Cerrando sesión de Correos...")
             ventana_principal.update_idletasks()
+
+            cerrar_sesion_correos(driver, timeout=15)
 
             cerrar_driver_correos(sincronizar_perfil=True)
 
@@ -1768,12 +2565,55 @@ def mostrar_preview(pdf_path, paginas):
     ventana = tk.Toplevel(ventana_principal)
     ventana_preview = ventana
     ventana.title("Seleccionar páginas")
-    ventana.geometry("820x720")
+    ventana.geometry("600x720")
     ventana.configure(bg=INFO_BG)
     ventana.protocol("WM_DELETE_WINDOW", lambda v=ventana: cerrar_preview(v))
 
-    canvas = tk.Canvas(ventana, bg=INFO_BG)
-    scrollbar = tk.Scrollbar(ventana, command=canvas.yview)
+    # ===== Helpers visuales =====
+    def crear_boton(master, texto, comando, bg="#2d2d2d", fg="#ffffff", ancho=18, activebg=None):
+        return tk.Button(
+            master,
+            text=texto,
+            command=comando,
+            bg=bg,
+            fg=fg,
+            activebackground=activebg or bg,
+            activeforeground=fg,
+            relief="flat",
+            bd=0,
+            font=("Segoe UI", 10, "bold"),
+            padx=12,
+            pady=8,
+            cursor="hand2",
+            width=ancho,
+    )
+    # ===== Cabecera =====
+    topbar = tk.Frame(ventana, bg=INFO_BG)
+    topbar.pack(fill="x", padx=12, pady=(12, 8))
+
+    tk.Label(
+        topbar,
+        text="Selecciona los pedidos a procesar",
+        font=("Segoe UI", 12, "bold"),
+        bg=INFO_BG,
+        fg=FG_COLOR,
+    ).pack(side="left")
+
+    acciones_top = tk.Frame(topbar, bg=INFO_BG)
+    acciones_top.pack(side="right")
+
+    # ===== Zona scroll =====
+
+    contenedor = tk.Frame(ventana, bg=INFO_BG)
+    contenedor.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+
+    canvas = tk.Canvas(
+        contenedor,
+        bg=INFO_BG,
+        highlightthickness=0,
+        bd=0,
+    )
+    scrollbar = tk.Scrollbar(contenedor, command=canvas.yview)
     frame = tk.Frame(canvas, bg=INFO_BG)
 
     canvas.create_window((0, 0), window=frame, anchor="nw")
@@ -1783,44 +2623,136 @@ def mostrar_preview(pdf_path, paginas):
 
     frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
 
+    def _on_mousewheel(event):
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_mousewheel_linux_up(event):
+        canvas.yview_scroll(-1, "units")
+
+    def _on_mousewheel_linux_down(event):
+        canvas.yview_scroll(1, "units")
+
+    def _activar_scroll_rueda(_event=None):
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)          # Windows / macOS
+        canvas.bind_all("<Button-4>", _on_mousewheel_linux_up)   # Linux
+        canvas.bind_all("<Button-5>", _on_mousewheel_linux_down) # Linux
+
+    def _desactivar_scroll_rueda(_event=None):
+        canvas.unbind_all("<MouseWheel>")
+        canvas.unbind_all("<Button-4>")
+        canvas.unbind_all("<Button-5>")
+
+    canvas.bind("<Enter>", _activar_scroll_rueda)
+    canvas.bind("<Leave>", _desactivar_scroll_rueda)
+    frame.bind("<Enter>", _activar_scroll_rueda)
+    frame.bind("<Leave>", _desactivar_scroll_rueda)
+
     checks = []
 
     tk.Label(
         frame,
-        text="Nº     | CP     | Nombre               | Dirección                              | Ciudad",
+        text=f"{'Nº Pedido':^10}    | {'Nombre':^32} | {'Código postal':^13}",
         font=("Consolas", 10, "bold"),
         bg=INFO_BG,
         fg="#aaaaaa",
-    ).pack(anchor="w", padx=10, pady=5)
+    ).pack(anchor="w", padx=10, pady=(6, 8))
 
-    for i, linea in paginas:
+    filas_frame = tk.Frame(frame, bg=INFO_BG)
+    filas_frame.pack(fill="both", expand=True)
+
+    for idx, (i, linea) in enumerate(paginas):
         var = tk.BooleanVar(value=True)
         checks.append((i, var))
+
+        fila_bg = INFO_BG if idx % 2 == 0 else "#2b2b2b"
+
+        fila = tk.Frame(filas_frame, bg=fila_bg)
+        fila.pack(fill="x", padx=6, pady=2)
+
         tk.Checkbutton(
-            frame,
+            fila,
             text=linea,
             variable=var,
-            bg=INFO_BG,
+            bg=fila_bg,
             fg=FG_COLOR,
-            selectcolor="#333",
+            activebackground=fila_bg,
+            activeforeground=FG_COLOR,
+            selectcolor="#333333",
+            relief="flat",
+            bd=0,
             font=("Consolas", 10),
-        ).pack(anchor="w", padx=10, pady=3)
+            anchor="w",
+            padx=8,
+            pady=6,
+        ).pack(anchor="w", fill="x")
+
+    def seleccionar_todo():
+        for _, var in checks:
+            var.set(True)
+
+    def deseleccionar_todo():
+        for _, var in checks:
+            var.set(False)
 
     def confirmar():
         seleccionadas = [i for i, var in checks if var.get()]
-        codigos_por_pagina = {i: cache_preview_paginas[i][1] for i in seleccionadas if i in cache_preview_paginas}
+        if not seleccionadas:
+            messagebox.showwarning("Selección vacía", "Debes seleccionar al menos un pedido.")
+            return
+
+        codigos_por_pagina = {
+            i: cache_preview_paginas[i][1]
+            for i in seleccionadas
+            if i in cache_preview_paginas
+        }
+
         ventana.destroy()
         etiqueta_estado.config(text="Procesando selección...")
         iniciar_proceso_filtrado(seleccionadas, codigos_por_pagina)
 
-    tk.Button(
-        ventana,
-        text="Procesar selección",
-        command=confirmar,
-        bg=BUTTON_COLOR,
-        fg=FG_COLOR,
-    ).pack(pady=10)
+    def cancelar():
+        cerrar_preview(ventana)
 
+    crear_boton(
+        acciones_top,
+        "✓ Seleccionar todo",
+        seleccionar_todo,
+        bg="#3b5875",
+        activebg="#49698a",
+        ancho=16,
+    ).pack(side="left", padx=4)
+
+    crear_boton(
+        acciones_top,
+        "✕ Deseleccionar",
+        deseleccionar_todo,
+        bg="#5a5f6b",
+        activebg="#6a7080",
+        ancho=16,
+    ).pack(side="left", padx=4)
+
+
+    # ===== Botonera inferior =====
+    bottom = tk.Frame(ventana, bg=INFO_BG)
+    bottom.pack(fill="x", padx=12, pady=(0, 14))
+
+    crear_boton(
+        bottom,
+        "Cancelar",
+        cancelar,
+        bg="#4a4f59",
+        activebg="#5a6070",
+        ancho=14,
+    ).pack(side="left")
+
+    crear_boton(
+        bottom,
+        "Procesar selección",
+        confirmar,
+        bg="#2f8f4e",
+        activebg="#3aa95b",
+        ancho=18,
+    ).pack(side="right")
 
 # === GENERACIÓN FINAL DESDE CACHÉ ===
 def worker_generacion_desde_cache(paginas_seleccionadas, cola_local, codigos_por_pagina):
@@ -1898,7 +2830,10 @@ def actualizar_interfaz_desde_cola():
                         "🟡 Lanzando subida automática a Correos..."
                     )
                 )
-                ventana_principal.after(300, subir_archivo_a_correos)
+                ventana_principal.after(
+                    300,
+                    lambda: threading.Thread(target=subir_archivo_a_correos, daemon=True).start()
+                )
 
     except Empty:
         pass
@@ -1935,7 +2870,14 @@ def abrir_carpeta():
     """Abre en el explorador la carpeta que contiene el archivo actualmente seleccionado."""
     if ruta_archivo_actual:
         os.startfile(os.path.dirname(ruta_archivo_actual))
-
+        
+def mostrar_menu_opciones(menu, boton):
+    try:
+        x = boton.winfo_rootx()
+        y = boton.winfo_rooty() + boton.winfo_height()
+        menu.tk_popup(x, y)
+    finally:
+        menu.grab_release()
 
 # === EVENTOS DE INTERFAZ ===
 def manejar_drop_pdf(event):
@@ -1966,7 +2908,7 @@ def mostrar_info_aplicacion():
     """Abre la ventana informativa con los datos de versión, autoría y licencia del programa."""
     ventana = tk.Toplevel(ventana_principal)
     ventana.title("Información")
-    ventana.geometry("500x450")
+    ventana.geometry("550x450")
     ventana.configure(bg=INFO_BG)
     ventana.resizable(False, False)
 
@@ -2110,15 +3052,38 @@ def main():
 
     frame_login = tk.Frame(frame_botones, bg=BG_COLOR)
     frame_login.pack(side="bottom", expand=True)
-
-    tk.Button(
-        frame_login,
-        text="🔐 Iniciar sesión Correos",
-        command=abrir_login_correos,
+    menu_opciones = tk.Menu(
+        ventana_principal,
+        tearoff=0,
         bg=BUTTON_COLOR,
         fg=FG_COLOR,
-    ).pack(pady=5)
+        activebackground="#3a3a3a",
+        activeforeground=FG_COLOR,
+        relief="flat",
+        bd=0,
+        font=("Segoe UI", 11, "bold"),
+    )
+    menu_opciones.add_command(
+        label="🔑 Configurar credenciales",
+        command=configurar_credenciales_correos,
+    )
+    menu_opciones.add_command(
+        label="🗑️ Borrar credenciales",
+        command=eliminar_credenciales_correos_ui,
+    )
 
+    boton_menu = tk.Button(
+        ventana_principal,
+        text="⋮",
+        command=lambda: mostrar_menu_opciones(menu_opciones, boton_menu),
+        bg=BUTTON_COLOR,
+        fg=FG_COLOR,
+        relief="flat",
+        font=("Segoe UI", 12, "bold"),
+        width=3,
+        cursor="hand2",
+    )
+    boton_menu.place(relx=1.0, rely=0.0, anchor="ne", x=-8, y=8)
     tk.Button(
         frame_login,
         text="🖨️ Abrir PDF descargado e imprimir",
