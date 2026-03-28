@@ -375,6 +375,35 @@ def _abrir_generador_si_hay_sesion(driver, timeout=18):
     )
 
 
+def cerrar_sesion_correos_ui():
+    def _worker():
+        try:
+            ui_set_estado("🔓 Forzando cierre de sesión de Correos...")
+
+            driver = obtener_driver_correos(
+                headless=False,
+                forzar_nuevo=False,
+            )
+
+            ok = cerrar_sesion_correos(driver, timeout=15)
+
+            cerrar_driver_correos(sincronizar_perfil=True)
+
+            if ok:
+                ui_set_estado("✅ Sesión de Correos cerrada correctamente.")
+            else:
+                ui_set_estado("⚠️ No se pudo cerrar la sesión de Correos.")
+        except Exception as e:
+            print(traceback.format_exc())
+            try:
+                cerrar_driver_correos()
+            except Exception:
+                pass
+            ui_show_error("Correos", f"No se pudo cerrar la sesión:\n{e}")
+            ui_set_estado(f"❌ Error al cerrar sesión de Correos: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+    
 def login_automatico_correos(driver, timeout=18):
     """Hace login automático en Correos usando credenciales guardadas en keyring."""
     usuario, password = cargar_credenciales_correos()
@@ -507,33 +536,6 @@ def login_automatico_correos(driver, timeout=18):
     raise RuntimeError(
         f"No se pudo confirmar la sesión de Correos tras el login. URL final: {(driver.current_url or '').lower()}"
     )
-
-
-def asegurar_sesion_correos(driver, timeout=30):
-    """Garantiza que haya una sesión válida en Correos antes de continuar."""
-    ui_set_estado("🔐 Verificando sesión de Correos...")
-
-    driver.get(CORREOS_LOGIN_URL)
-    esperar_carga_completa_pagina(driver, timeout=timeout)
-    enfocar_pestana_correos(driver)
-
-    url_actual = (driver.current_url or "").lower()
-
-    # Si ya estamos en /home, no nos quedamos ahí: abrimos el generador
-    if "/home" in url_actual:
-        _abrir_generador_si_hay_sesion(driver, timeout=timeout)
-        return
-
-    # Si seguimos en login, hacemos login automático
-    if _pagina_parece_login_correos(driver):
-        login_automatico_correos(driver, timeout=timeout)
-        return
-
-    # Si estamos en otra página autenticada, intentamos abrir el generador
-    if _abrir_generador_si_hay_sesion(driver, timeout=timeout):
-        return
-
-    raise RuntimeError("No se pudo confirmar una sesión válida de Correos.")
 
 def _pagina_parece_login_correos(driver):
     """Detecta el login real de Correos evitando falsos positivos."""
@@ -2870,7 +2872,27 @@ def abrir_carpeta():
     """Abre en el explorador la carpeta que contiene el archivo actualmente seleccionado."""
     if ruta_archivo_actual:
         os.startfile(os.path.dirname(ruta_archivo_actual))
-        
+
+def cambiar_modo_headless_ui(headless_var):
+    global CORREOS_AUTOMATION_HEADLESS
+
+    nuevo_valor = bool(headless_var.get())
+    if CORREOS_AUTOMATION_HEADLESS == nuevo_valor:
+        return
+
+    CORREOS_AUTOMATION_HEADLESS = nuevo_valor
+
+    try:
+        cerrar_driver_correos(sincronizar_perfil=True)
+    except Exception:
+        pass
+
+    ui_set_estado(
+        "⚙️ Modo headless activado. Se aplicará en la próxima conexión a Correos."
+        if CORREOS_AUTOMATION_HEADLESS
+        else "🖥️ Modo visible activado. Se aplicará en la próxima conexión a Correos."
+    )
+    
 def mostrar_menu_opciones(menu, boton):
     try:
         x = boton.winfo_rootx()
@@ -2936,7 +2958,7 @@ def mostrar_info_aplicacion():
 
     tk.Label(
         scroll_frame,
-        text="Desarrollado por: Chema\nVersión 1.2",
+        text="Desarrollado por: Chema\nVersión 1.3",
         font=("Segoe UI", 10),
         fg="#cccccc",
         bg=INFO_BG,
@@ -2982,7 +3004,7 @@ DERIVADO DE, O EN CONEXIÓN CON EL SOFTWARE O EL USO DEL MISMO.
 def main():
     """Construye la interfaz principal, registra eventos y arranca el bucle de la aplicación."""
     global ventana_principal, etiqueta_estado, barra_progreso, boton_abrir_carpeta, boton_copiar_ruta, boton_subir_correos, boton_postlibri, etiqueta_estado_impresora, boton_actualizar_impresora
-
+    
     ventana_principal = TkinterDnD.Tk()
     ventana_principal.title("Extractor de Códigos Postales")
     ventana_principal.geometry("720x400")
@@ -3018,13 +3040,13 @@ def main():
         fg=FG_COLOR,
         bg=BG_COLOR,
     ).pack(pady=20)
-
+    
     etiqueta_estado = tk.Label(frame, text="Arrastra aquí tu PDF", fg=TEXT_SECONDARY, bg=BG_COLOR)
     etiqueta_estado.pack(pady=10)
 
     estado_frame = tk.Frame(frame, bg=BG_COLOR)
     estado_frame.pack(pady=(0, 8))
-
+    headless_var = tk.BooleanVar(value=CORREOS_AUTOMATION_HEADLESS)
     etiqueta_estado_impresora = tk.Label(
         estado_frame,
         text=f"Impresora: comprobando {POSTLIBRI_DEFAULT_PRINTER}...",
@@ -3071,7 +3093,19 @@ def main():
         label="🗑️ Borrar credenciales",
         command=eliminar_credenciales_correos_ui,
     )
-
+    menu_opciones.add_command(
+        label="🔓 Cerrar sesión Correos",
+        command=cerrar_sesion_correos_ui,
+    )
+    menu_opciones.add_separator()
+    menu_opciones.add_checkbutton(
+        label="👻 Ver ventanas de Chrome",
+        variable=headless_var,
+        onvalue=True,
+        offvalue=False,
+        command=lambda: cambiar_modo_headless_ui(headless_var),
+    )
+   
     boton_menu = tk.Button(
         ventana_principal,
         text="⋮",
