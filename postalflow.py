@@ -1258,6 +1258,8 @@ def _postlibri_bpac_invocar(obj, nombre_metodo, *args, obligatorio=True):
 
 def postlibri_imprimir_lbxs(lbx_paths, printer_name=POSTLIBRI_DEFAULT_PRINTER):
     """Envía una secuencia de archivos LBX a la impresora Brother mediante la automatización b-PAC de Windows."""
+    global bpac_primera_impresion_sesion
+
     if os.name != "nt":
         raise RuntimeError("La impresión b-PAC solo está disponible en Windows")
 
@@ -1280,6 +1282,14 @@ def postlibri_imprimir_lbxs(lbx_paths, printer_name=POSTLIBRI_DEFAULT_PRINTER):
 
                 _postlibri_bpac_invocar(obj_doc, "SetPrinter", printer_name, True)
                 _postlibri_bpac_invocar(obj_doc, "StartPrint", "", 0)
+
+                # Primera impresión de la sesión: damos margen al driver / b-PAC
+                if bpac_primera_impresion_sesion:
+                    time.sleep(1.0)
+                    bpac_primera_impresion_sesion = False
+                else:
+                    time.sleep(0.15)
+
                 _postlibri_bpac_invocar(obj_doc, "PrintOut", 1, 0)
 
                 end_print = getattr(obj_doc, "EndPrint", None)
@@ -1292,6 +1302,7 @@ def postlibri_imprimir_lbxs(lbx_paths, printer_name=POSTLIBRI_DEFAULT_PRINTER):
 
                 if idx < total:
                     time.sleep(0.35)
+
             except Exception as e:
                 raise RuntimeError(
                     f"Error al imprimir la etiqueta {idx}/{total} en Brother QL-700: {e}"
@@ -1304,7 +1315,11 @@ def postlibri_imprimir_lbxs(lbx_paths, printer_name=POSTLIBRI_DEFAULT_PRINTER):
 
 def postlibri_obtener_estado_impresora(printer_name=POSTLIBRI_DEFAULT_PRINTER):
     """Consulta por WMI el estado operativo de la impresora configurada y devuelve un resumen apto para UI."""
+    pythoncom = None
+    com_inicializado = False
+
     try:
+        import pythoncom
         import win32com.client
     except Exception:
         return {
@@ -1316,91 +1331,105 @@ def postlibri_obtener_estado_impresora(printer_name=POSTLIBRI_DEFAULT_PRINTER):
         }
 
     try:
-        locator = win32com.client.Dispatch("WbemScripting.SWbemLocator")
-        svc = locator.ConnectServer(".", r"root\cimv2")
-        safe_name = printer_name.replace(chr(92), chr(92) * 2).replace("'", chr(92) + "'")
-        query = (
-            "SELECT Name, WorkOffline, Availability, PrinterStatus, ExtendedPrinterStatus, Status, "
-            "DetectedErrorState FROM Win32_Printer WHERE Name = '%s'" % safe_name
+        pythoncom.CoInitialize()
+        com_inicializado = True
+    except Exception:
+        pass
+
+    try:
+        ultimo_error = None
+
+        for _ in range(3):
+            try:
+                locator = win32com.client.Dispatch("WbemScripting.SWbemLocator")
+                svc = locator.ConnectServer(".", r"root\cimv2")
+                safe_name = printer_name.replace(chr(92), chr(92) * 2).replace("'", chr(92) + "'")
+                query = (
+                    "SELECT Name, WorkOffline, Availability, PrinterStatus, ExtendedPrinterStatus, Status, "
+                    "DetectedErrorState FROM Win32_Printer WHERE Name = '%s'" % safe_name
+                )
+                printers = list(svc.ExecQuery(query))
+                break
+            except Exception as e:
+                ultimo_error = e
+                printers = None
+                time.sleep(0.6)
+        else:
+            return {
+                "ok": False,
+                "state": "wmi_error",
+                "text": f"Impresora: error consultando {printer_name}",
+                "color": "#ff6b6b",
+                "detail": str(ultimo_error),
+            }
+
+        if not printers:
+            return {
+                "ok": False,
+                "state": "not_found",
+                "text": f"Impresora: {printer_name} no encontrada",
+                "color": "#ff6b6b",
+                "detail": "La cola no existe en Windows.",
+            }
+
+        p = printers[0]
+        work_offline = bool(getattr(p, "WorkOffline", False))
+        availability = int(getattr(p, "Availability", 0) or 0)
+        printer_status = int(getattr(p, "PrinterStatus", 0) or 0)
+        extended_status = int(getattr(p, "ExtendedPrinterStatus", 0) or 0)
+        detected_error = int(getattr(p, "DetectedErrorState", 0) or 0)
+        status_text = str(getattr(p, "Status", "") or "").strip()
+
+        detail = (
+            f"WorkOffline={work_offline}, Availability={availability}, PrinterStatus={printer_status}, "
+            f"ExtendedPrinterStatus={extended_status}, DetectedErrorState={detected_error}, Status='{status_text}'"
         )
-        printers = list(svc.ExecQuery(query))
-    except Exception as e:
-        return {
-            "ok": False,
-            "state": "wmi_error",
-            "text": f"Impresora: error consultando {printer_name}",
-            "color": "#ff6b6b",
-            "detail": str(e),
-        }
 
-    if not printers:
-        return {
-            "ok": False,
-            "state": "not_found",
-            "text": f"Impresora: {printer_name} no encontrada",
-            "color": "#ff6b6b",
-            "detail": "La cola no existe en Windows.",
-        }
+        if work_offline or availability == 8 or printer_status == 7 or status_text.lower() == "offline":
+            return {
+                "ok": False,
+                "state": "offline",
+                "text": f"Impresora: {printer_name} offline",
+                "color": "#ff6b6b",
+                "detail": detail,
+            }
 
-    p = printers[0]
-    work_offline = bool(getattr(p, "WorkOffline", False))
-    availability = int(getattr(p, "Availability", 0) or 0)
-    printer_status = int(getattr(p, "PrinterStatus", 0) or 0)
-    extended_status = int(getattr(p, "ExtendedPrinterStatus", 0) or 0)
-    detected_error = int(getattr(p, "DetectedErrorState", 0) or 0)
-    status_text = str(getattr(p, "Status", "") or "").strip()
+        if printer_status == 8:
+            return {
+                "ok": False,
+                "state": "paper_jam",
+                "text": f"Impresora: {printer_name} atasco de papel",
+                "color": "#ff6b6b",
+                "detail": detail,
+            }
 
-    detail = (
-        f"WorkOffline={work_offline}, Availability={availability}, PrinterStatus={printer_status}, "
-        f"ExtendedPrinterStatus={extended_status}, DetectedErrorState={detected_error}, Status='{status_text}'"
-    )
+        if printer_status == 5 or extended_status == 7:
+            return {
+                "ok": False,
+                "state": "warming_up",
+                "text": f"Impresora: {printer_name} calentando",
+                "color": "#f0ad4e",
+                "detail": detail,
+            }
 
-    if work_offline or availability == 8 or printer_status == 7 or status_text.lower() == "offline":
-        return {
-            "ok": False,
-            "state": "offline",
-            "text": f"Impresora: {printer_name} offline",
-            "color": "#ff6b6b",
-            "detail": detail,
-        }
+        if printer_status == 9:
+            return {
+                "ok": False,
+                "state": "out_of_paper",
+                "text": f"Impresora: {printer_name} sin etiquetas/papel",
+                "color": "#f0ad4e",
+                "detail": detail,
+            }
 
-    if printer_status == 8:
-        return {
-            "ok": False,
-            "state": "paper_jam",
-            "text": f"Impresora: {printer_name} atasco de papel",
-            "color": "#ff6b6b",
-            "detail": detail,
-        }
+        if printer_status == 1:
+            return {
+                "ok": False,
+                "state": "paused",
+                "text": f"Impresora: {printer_name} pausada",
+                "color": "#f0ad4e",
+                "detail": detail,
+            }
 
-    if printer_status == 5 or extended_status == 7:
-        return {
-            "ok": False,
-            "state": "warming_up",
-            "text": f"Impresora: {printer_name} calentando",
-            "color": "#f0ad4e",
-            "detail": detail,
-        }
-
-    if printer_status == 9:
-        return {
-            "ok": False,
-            "state": "out_of_paper",
-            "text": f"Impresora: {printer_name} sin etiquetas/papel",
-            "color": "#f0ad4e",
-            "detail": detail,
-        }
-
-    if printer_status == 1:
-        return {
-            "ok": False,
-            "state": "paused",
-            "text": f"Impresora: {printer_name} pausada",
-            "color": "#f0ad4e",
-            "detail": detail,
-        }
-
-    if printer_status in (2, 3, 4, 6, 10) or status_text.lower() in ("ok", "idle", "degraded", "unknown"):
         return {
             "ok": True,
             "state": "online",
@@ -1409,14 +1438,12 @@ def postlibri_obtener_estado_impresora(printer_name=POSTLIBRI_DEFAULT_PRINTER):
             "detail": detail,
         }
 
-    return {
-        "ok": True,
-        "state": "available",
-        "text": f"Impresora: {printer_name} disponible",
-        "color": "#4caf50",
-        "detail": detail,
-    }
-
+    finally:
+        if pythoncom is not None and com_inicializado:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
 def postlibri_aplicar_estado_impresora_ui(estado):
     """Pinta en la interfaz el estado actual de la impresora Brother."""
@@ -2121,6 +2148,46 @@ def enfocar_pestana_correos(driver):
         pass
     return False
 
+bpac_primera_impresion_sesion = True
+
+def esperar_archivo_pdf_estable(ruta_pdf, timeout=15, ciclos_estables=3):
+    """Espera a que el PDF descargado exista, tenga tamaño estable y pueda abrirse en lectura."""
+    ruta = Path(ruta_pdf).resolve()
+    fin = time.time() + timeout
+    ultimo_tamano = -1
+    estables = 0
+
+    while time.time() < fin:
+        try:
+            if not ruta.exists():
+                time.sleep(0.3)
+                continue
+
+            tamano = ruta.stat().st_size
+
+            # Probamos apertura en lectura para asegurarnos de que ya no está en transición
+            with open(ruta, "rb") as f:
+                f.read(1)
+
+            if tamano > 0 and tamano == ultimo_tamano:
+                estables += 1
+                if estables >= ciclos_estables:
+                    return str(ruta)
+            else:
+                estables = 0
+
+            ultimo_tamano = tamano
+
+        except PermissionError:
+            estables = 0
+        except OSError:
+            estables = 0
+
+        time.sleep(0.35)
+
+    raise TimeoutException(
+        f"El PDF descargado no llegó a estabilizarse a tiempo: {ruta}"
+    )
 
 def postlibri_imprimir_pdf_descargado(pdf_path):
     """Procesa un PDF descargado desde Correos, genera sus etiquetas y las envía a la impresora Brother."""
@@ -2133,8 +2200,14 @@ def postlibri_imprimir_pdf_descargado(pdf_path):
     if Image is None:
         raise RuntimeError("Pillow es obligatorio para procesar el PDF descargado de Correos.")
 
-    estado_impresora = postlibri_obtener_estado_impresora(POSTLIBRI_DEFAULT_PRINTER)
-    if not estado_impresora["ok"]:
+    estado_impresora = None
+    for _ in range(3):
+        estado_impresora = postlibri_obtener_estado_impresora(POSTLIBRI_DEFAULT_PRINTER)
+        if estado_impresora["ok"]:
+            break
+        time.sleep(0.8)
+
+    if not estado_impresora or not estado_impresora["ok"]:
         raise RuntimeError(estado_impresora["text"])
 
     out_dir = None
@@ -2355,6 +2428,8 @@ def subir_archivo_a_correos():
 
             # 4) Esperamos a que Correos genere y descargue el PDF final de etiquetas.
             etiqueta_estado.config(text="🟡 Esperando descarga del PDF de Correos...")
+
+
             pdf_descargado = esperar_pdf_descargado_o_login(
                 driver,
                 download_dir,
@@ -2365,13 +2440,16 @@ def subir_archivo_a_correos():
             ventana_principal.update_idletasks()
 
             cerrar_sesion_correos(driver, timeout=15)
-
             cerrar_driver_correos(sincronizar_perfil=True)
+
+            etiqueta_estado.config(text="🟡 Esperando a que el PDF quede listo para Brother...")
+            ventana_principal.update_idletasks()
+            pdf_descargado = esperar_archivo_pdf_estable(pdf_descargado, timeout=15)
 
             etiqueta_estado.config(text="🟡 Generando etiquetas Brother desde el PDF descargado...")
             ventana_principal.update_idletasks()
-            # 5) Convertimos el PDF descargado al formato de impresión Brother y lanzamos la cola.
             resultado_impresion = postlibri_imprimir_pdf_descargado(pdf_descargado)
+
 
             etiqueta_estado.config(
                 text=(
